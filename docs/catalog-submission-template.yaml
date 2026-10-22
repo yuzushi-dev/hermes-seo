@@ -24,7 +24,7 @@ maintainer: yuzushi-dev
 tier: community
 category: tools
 requires_hermes: ">=0.22.2"
-version: "0.1.1"
+version: "0.1.2"
 readme: true
 platforms: [linux, macos]
 capabilities:

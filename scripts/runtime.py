@@ -25,8 +25,15 @@ from typing import Any
 
 RUNTIME_SCHEMA = 1
 LOCK_STALE_SECONDS = 30 * 60
+MIN_UV_VERSION = (0, 13, 4)
+MIN_PIP_VERSION = (26, 2, 2)
 SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.py$")
 EXTENSION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+TOOL_VERSION_RE = re.compile(
+    r"^(?P<release>\d+(?:\.\d+)*)(?P<prerelease>(?:a|b|rc|\.?dev)\d*)?"
+    r"(?:\.post\d*)?(?:\+[A-Za-z0-9.-]+)?$",
+    re.IGNORECASE,
+)
 MANUAL_EXTENSION_SKILLS = {"banana": "seo-image-gen"}
 ALLOWED_CORE_SCRIPTS = frozenset(
     {
@@ -259,6 +266,87 @@ def _run_checked(
     return result
 
 
+def _tool_version_at_least(output: str, tool: str, minimum: tuple[int, ...]) -> bool:
+    """Parse standard ``tool version ...`` output and reject floor prereleases."""
+    prefix = re.match(rf"^\s*{re.escape(tool)}\s+(\S+)", output, re.IGNORECASE)
+    if not prefix:
+        return False
+    match = TOOL_VERSION_RE.fullmatch(prefix.group(1))
+    if not match:
+        return False
+    version = tuple(int(part) for part in match.group("release").split("."))
+    width = max(len(version), len(minimum))
+    version += (0,) * (width - len(version))
+    floor = minimum + (0,) * (width - len(minimum))
+    if version != floor:
+        return version > floor
+    return match.group("prerelease") is None
+
+
+def _install_dependencies(staged_python: Path, root: Path, env: dict[str, str]) -> None:
+    uv = shutil.which("uv")
+    if uv:
+        try:
+            uv_version = _run_checked([uv, "--version"], env=env, stage="uv version check")
+        except (OSError, RuntimeError):
+            uv_version = None
+        if uv_version and _tool_version_at_least(uv_version.stdout, "uv", MIN_UV_VERSION):
+            _run_checked(
+                [
+                    uv,
+                    "pip",
+                    "install",
+                    "--python",
+                    str(staged_python),
+                    f"pip>={'.'.join(map(str, MIN_PIP_VERSION))}",
+                    "-r",
+                    str(root / "requirements.txt"),
+                ],
+                env=env,
+                stage="dependency installation",
+            )
+            return
+
+    actionable_error = (
+        "cannot verify a safe local pip bootstrap: pip >=26.2.2 is required; "
+        "install uv >=0.13.4 or use a Python distribution whose ensurepip bundles "
+        "pip >=26.2.2, then retry. No dependencies were downloaded."
+    )
+    try:
+        _run_checked(
+            [str(staged_python), "-m", "ensurepip", "--upgrade", "--default-pip"],
+            env=env,
+            stage="pip bootstrap",
+        )
+    except (OSError, RuntimeError) as exc:
+        detail = _tail(str(exc))
+        raise RuntimeError(f"{actionable_error}\n{detail}" if detail else actionable_error) from None
+    try:
+        pip_version = _run_checked(
+            [str(staged_python), "-m", "pip", "--version"],
+            env=env,
+            stage="pip version verification",
+        )
+    except (OSError, RuntimeError):
+        raise RuntimeError(actionable_error) from None
+    if not _tool_version_at_least(pip_version.stdout, "pip", MIN_PIP_VERSION):
+        raise RuntimeError(actionable_error)
+    _run_checked(
+        [
+            str(staged_python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            f"pip>={'.'.join(map(str, MIN_PIP_VERSION))}",
+            "-r",
+            str(root / "requirements.txt"),
+        ],
+        env=env,
+        stage="dependency installation",
+    )
+
+
 class SetupLock:
     def __init__(self, path: Path):
         self.path = path
@@ -311,16 +399,7 @@ def command_setup(args: argparse.Namespace) -> int:
                 stage="virtual environment creation",
             )
             staged_python = _venv_python(staged)
-            _run_checked(
-                [str(staged_python), "-m", "ensurepip", "--upgrade", "--default-pip"],
-                env=env,
-                stage="pip bootstrap",
-            )
-            _run_checked(
-                [str(staged_python), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(root / "requirements.txt")],
-                env=env,
-                stage="dependency installation",
-            )
+            _install_dependencies(staged_python, root, env)
             if not args.skip_browser:
                 try:
                     _run_checked(

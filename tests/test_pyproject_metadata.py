@@ -43,6 +43,11 @@ def test_requirements_keep_security_and_compatibility_floors() -> None:
         "numpy": (2, 2, 6),
         "google-auth-httplib2": (0, 4, 0),
         "google-ads": (25, 0, 0),
+        "certifi": (2026, 10, 19),
     }
     for package, minimum in minimums.items():
         assert _floor(text, package) >= minimum, f"{package} floor is below {minimum}"
+
+    certifi_line = next(line for line in text.splitlines() if line.startswith("certifi>="))
+    assert "certifi>=2026.10.19,<2027.0.0" in certifi_line
+    assert "eMudhra" in certifi_line

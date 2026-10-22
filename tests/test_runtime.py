@@ -177,6 +177,7 @@ def test_setup_restores_previous_environment_when_staged_swap_fails(
     )
     monkeypatch.setenv("HERMES_SEO_DATA_DIR", str(data))
     monkeypatch.setattr(runtime, "_root", lambda: root)
+    monkeypatch.setattr(runtime.shutil, "which", lambda _: None)
 
     def fake_checked(argv: list[str], *, env: dict[str, str], stage: str) -> subprocess.CompletedProcess[str]:
         if stage == "virtual environment creation":
@@ -184,6 +185,10 @@ def test_setup_restores_previous_environment_when_staged_swap_fails(
             staged_python = runtime._venv_python(staged)
             staged_python.parent.mkdir(parents=True)
             staged_python.write_text("new", encoding="utf-8")
+        if stage == "pip version verification":
+            return subprocess.CompletedProcess(
+                argv, 0, "pip 26.2.2 from /venv/site-packages/pip (python 3.14)", ""
+            )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     original_replace = Path.replace
@@ -200,6 +205,172 @@ def test_setup_restores_previous_environment_when_staged_swap_fails(
     assert (final / "old-sentinel").read_text(encoding="utf-8") == "keep"
     assert not (data / ".venv.previous").exists()
     assert not (data / ".runtime-state.next").exists()
+
+
+def _run_setup_for_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    uv_path: str | None,
+    uv_version: str = "uv 0.13.4 (test)",
+    pip_version: str = "pip 26.2.2 from /venv/lib/python/site-packages/pip (python 3.14)",
+    uv_probe_error: bool = False,
+    pip_probe_error: bool = False,
+    bootstrap_error: bool = False,
+) -> tuple[int, list[tuple[str, list[str]]], Path]:
+    root = _fixture_root(tmp_path)
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SEO_DATA_DIR", str(data))
+    monkeypatch.setattr(runtime, "_root", lambda: root)
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: uv_path if name == "uv" else None)
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_checked(
+        argv: list[str], *, env: dict[str, str], stage: str
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((stage, argv))
+        if stage == "virtual environment creation":
+            staged = Path(argv[-1])
+            staged_python = runtime._venv_python(staged)
+            staged_python.parent.mkdir(parents=True)
+            staged_python.write_text("new", encoding="utf-8")
+        if stage == "uv version check":
+            if uv_probe_error:
+                raise OSError("injected uv probe failure")
+            return subprocess.CompletedProcess(argv, 0, uv_version, "")
+        if stage == "pip version verification":
+            if pip_probe_error:
+                raise OSError("injected pip probe failure")
+            return subprocess.CompletedProcess(argv, 0, pip_version, "")
+        if stage == "pip bootstrap" and bootstrap_error:
+            raise RuntimeError("injected ensurepip failure")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(runtime, "_run_checked", fake_checked)
+    rc = runtime.command_setup(SimpleNamespace(skip_browser=True))
+    return rc, calls, root
+
+
+def test_setup_uses_uv_at_security_floor_without_bootstrapping_pip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, calls, root = _run_setup_for_bootstrap(tmp_path, monkeypatch, uv_path="/tools/uv")
+
+    assert rc == 0
+    assert any(stage == "uv version check" for stage, _ in calls)
+    assert not any(stage == "pip bootstrap" for stage, _ in calls)
+    install = next(argv for stage, argv in calls if stage == "dependency installation")
+    assert install[:2] == ["/tools/uv", "pip"]
+    assert "install" in install
+    assert "--python" in install
+    assert "pip>=26.2.2" in install
+    assert install[install.index("-r") + 1] == str(root / "requirements.txt")
+
+
+def test_setup_does_not_accept_uv_prerelease_at_security_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, calls, _ = _run_setup_for_bootstrap(
+        tmp_path, monkeypatch, uv_path="/tools/uv", uv_version="uv 0.13.4rc1 (test)"
+    )
+
+    assert rc == 0
+    assert any(stage == "uv version check" for stage, _ in calls)
+    assert any(stage == "pip bootstrap" for stage, _ in calls)
+    install = next(argv for stage, argv in calls if stage == "dependency installation")
+    assert install[0] != "/tools/uv"
+
+
+def test_setup_falls_back_when_uv_version_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, calls, _ = _run_setup_for_bootstrap(
+        tmp_path, monkeypatch, uv_path="/tools/uv", uv_probe_error=True
+    )
+
+    assert rc == 0
+    assert any(stage == "uv version check" for stage, _ in calls)
+    assert any(stage == "pip bootstrap" for stage, _ in calls)
+    install = next(argv for stage, argv in calls if stage == "dependency installation")
+    assert install[0] != "/tools/uv"
+
+
+@pytest.mark.parametrize(
+    "pip_version",
+    [
+        "pip 26.2.1 from /venv/site-packages/pip (python 3.14)",
+        "pip 26.2.2rc1 from /venv/site-packages/pip (python 3.14)",
+        "pip version unavailable",
+    ],
+)
+def test_setup_refuses_unsafe_fallback_pip_before_dependency_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pip_version: str,
+) -> None:
+    rc, calls, _ = _run_setup_for_bootstrap(
+        tmp_path,
+        monkeypatch,
+        uv_path="/tools/uv",
+        uv_version="uv 0.13.3 (test)",
+        pip_version=pip_version,
+    )
+
+    assert rc == 1
+    assert any(stage == "pip bootstrap" for stage, _ in calls)
+    assert any(stage == "pip version verification" for stage, _ in calls)
+    assert not any(stage == "dependency installation" for stage, _ in calls)
+    error = capsys.readouterr().err
+    assert "26.2.2" in error
+    assert "uv" in error
+
+
+def test_setup_allows_safe_ensurepip_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, calls, root = _run_setup_for_bootstrap(tmp_path, monkeypatch, uv_path=None)
+
+    assert rc == 0
+    assert any(stage == "pip bootstrap" for stage, _ in calls)
+    assert any(stage == "pip version verification" for stage, _ in calls)
+    install = next(argv for stage, argv in calls if stage == "dependency installation")
+    assert install[1:4] == ["-m", "pip", "install"]
+    assert "pip>=26.2.2" in install
+    assert install[install.index("-r") + 1] == str(root / "requirements.txt")
+
+
+def test_setup_stops_actionably_when_local_pip_version_cannot_be_checked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc, calls, _ = _run_setup_for_bootstrap(
+        tmp_path, monkeypatch, uv_path=None, pip_probe_error=True
+    )
+
+    assert rc == 1
+    assert not any(stage == "dependency installation" for stage, _ in calls)
+    error = capsys.readouterr().err
+    assert "uv >=0.13.4" in error
+    assert "No dependencies were downloaded" in error
+
+
+def test_setup_stops_actionably_when_ensurepip_cannot_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc, calls, _ = _run_setup_for_bootstrap(
+        tmp_path, monkeypatch, uv_path=None, bootstrap_error=True
+    )
+
+    assert rc == 1
+    assert not any(stage == "dependency installation" for stage, _ in calls)
+    error = capsys.readouterr().err
+    assert "uv >=0.13.4" in error
+    assert "No dependencies were downloaded" in error
 
 
 def test_run_propagates_child_signal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -344,6 +515,7 @@ def test_browser_setup_warning_is_redacted(
     )
     monkeypatch.setenv("HERMES_SEO_DATA_DIR", str(data))
     monkeypatch.setattr(runtime, "_root", lambda: root)
+    monkeypatch.setattr(runtime.shutil, "which", lambda _: None)
     fake_home = tmp_path / "home" / "someone"
     monkeypatch.setattr(runtime.Path, "home", classmethod(lambda cls: fake_home))
 
@@ -353,6 +525,10 @@ def test_browser_setup_warning_is_redacted(
             staged_python = runtime._venv_python(staged)
             staged_python.parent.mkdir(parents=True)
             staged_python.write_text("new", encoding="utf-8")
+        if stage == "pip version verification":
+            return subprocess.CompletedProcess(
+                argv, 0, "pip 26.2.2 from /venv/site-packages/pip (python 3.14)", ""
+            )
         if stage == "Chromium installation":
             raise RuntimeError(
                 "Chromium installation failed with exit code 1\n"

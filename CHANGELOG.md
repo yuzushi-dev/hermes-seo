@@ -11,6 +11,15 @@ claims are not instructions for this catalog build.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-22
+
+### Security
+
+- The managed runtime now uses uv >=0.13.4 for dependency installation when
+  available, or verifies ensurepip's local pip is >=26.2.2 before allowing any
+  dependency download. The Requests runtime bundle now requires
+  certifi >=2026.10.19 to reject the eMudhra certificate chain.
+
 ## [2.4.2] - 2026-10-04
 
 seo-cockpit, Google sign-in through your own account, and a schema-hook fix.

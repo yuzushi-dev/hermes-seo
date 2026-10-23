@@ -217,8 +217,19 @@ def _validate_schema_object(
     for placeholder in BARE_PLACEHOLDER_RE.findall(text):
         errors.append(f"{prefix}: Contains placeholder text: {placeholder}")
 
-    # Check for deprecated types
-    schema_type = obj.get("@type", "")
+    # Check for deprecated types.
+    # @type may legitimately be a LIST — ["Organization", "ProfessionalService"] is
+    # valid Schema.org and is what multi-typed sites ship. A list is unhashable, so
+    # the membership tests below raised TypeError and the whole validation returned
+    # nothing (the host hook runner is fail-open, so the failure was silent).
+    # Normalise to a list of strings once and iterate.
+    raw_type = obj.get("@type", "")
+    if isinstance(raw_type, list):
+        schema_types = [t for t in raw_type if isinstance(t, str)]
+    elif isinstance(raw_type, str) and raw_type:
+        schema_types = [raw_type]
+    else:
+        schema_types = []
     deprecated = {
         "HowTo": "deprecated September 2023",
         "SpecialAnnouncement": "deprecated July 31, 2025",
@@ -228,16 +239,18 @@ def _validate_schema_object(
         "ClaimReview": "retired June 2025; fact-check rich results discontinued",
         "VehicleListing": "retired June 2025; vehicle listing structured data discontinued",
     }
-    if schema_type in deprecated:
-        errors.append(f"{prefix}: @type '{schema_type}' is {deprecated[schema_type]}")
+    for schema_type in schema_types:
+        if schema_type in deprecated:
+            errors.append(f"{prefix}: @type '{schema_type}' is {deprecated[schema_type]}")
 
     # Check for restricted types used incorrectly.
     # FAQPage is intentionally NOT flagged: Google retired FAQ rich results for
     # all sites (May 7, 2026), but FAQPage remains a valid Schema.org type.
     # This project makes no claim of a confirmed AI or ranking benefit.
     restricted: dict = {}
-    if schema_type in restricted:
-        errors.append(f"{prefix}: @type '{schema_type}' is {restricted[schema_type]}; verify site qualifies")
+    for schema_type in schema_types:
+        if schema_type in restricted:
+            errors.append(f"{prefix}: @type '{schema_type}' is {restricted[schema_type]}; verify site qualifies")
 
     if "@graph" in obj:
         if not isinstance(graph, list):

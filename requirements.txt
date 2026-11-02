@@ -26,4 +26,4 @@ google-api-python-client>=2.201.0,<3.0.0   # No known CVEs
 google-auth>=2.62.0,<3.0.0                  # No known CVEs
 google-auth-httplib2>=0.4.4,<1.0.0           # Compatibility floor for current google-auth stack
 google-analytics-data>=0.23.3,<1.0.0         # No known CVEs
-google-ads>=34.0.0,<40.0.0                   # Direct import in keyword_planner.py
+google-ads>=35.0.0,<40.0.0                   # Direct import in keyword_planner.py
